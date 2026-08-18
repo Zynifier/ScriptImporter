@@ -1,0 +1,12 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "Niagara JSON Importer",
+  "Description": "Imports FModel optional-editor Niagara JSON exports into editable Niagara scripts.",
+  "Category": "Editor",
+  "EnabledByDefault": true,
+  "CanContainContent": false,
+  "Modules": [{ "Name": "ScriptImporter", "Type": "Editor", "LoadingPhase": "Default" }],
+  "Plugins": [{ "Name": "Niagara", "Enabled": true }]
+}

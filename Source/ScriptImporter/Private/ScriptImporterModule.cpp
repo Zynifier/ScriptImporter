@@ -63,6 +63,7 @@ struct FImportReport
 
 static bool JsonVariable(const TSharedPtr<FJsonObject>& Json, FNiagaraVariable& OutVariable, FImportReport& Report);
 static FNiagaraTypeDefinition ResolveNiagaraType(const TSharedPtr<FJsonObject>& TypeJson, FImportReport& Report);
+static UNiagaraNodeOutput* FindMatchingOutput(UNiagaraGraph* Graph, ENiagaraScriptUsage Usage, const FGuid& UsageId = FGuid());
 
 static void WriteReportToOutputLog(const FString& Filename, const FImportReport& Report)
 {
@@ -214,7 +215,9 @@ static void ApplyScalarAndStructProperties(UObject* Target, const TSharedPtr<FJs
                 continue;
             }
         }
-        if (!FJsonObjectConverter::JsonValueToUProperty(Normalize(Pair.Value), Property, Property->ContainerPtrToValuePtr<void>(Target)))
+        // 4.26: this build's FJsonObjectConverter::JsonValueToUProperty does not default
+        // CheckFlags/SkipFlags, so they must be passed explicitly.
+        if (!FJsonObjectConverter::JsonValueToUProperty(Normalize(Pair.Value), Property, Property->ContainerPtrToValuePtr<void>(Target), 0, 0))
             Report.Warnings.Add(FString::Printf(TEXT("%s: could not set %s"), *Target->GetPathName(), *Name));
     }
     // FModel suffixes duplicate serialized fields (for example NodeGuid[21]).
@@ -246,11 +249,23 @@ static void ApplyObjectProperties(UObject* Target, const TSharedPtr<FJsonObject>
         if (ExportIndex(Pair.Value->AsObject(), Index))
             if (UObject* const* Found = Objects.Find(Index))
                 if ((*Found)->IsA(ObjectProperty->PropertyClass)) Resolved = *Found;
-        // Cross-version external Niagara scripts can load successfully while
-        // containing no output usage recognized by 17.XX; its function-call
-        // history code dereferences that missing output. Keep those references
-        // unresolved unless the function is part of this imported object set.
-        if (!Resolved && Property->GetName() != TEXT("FunctionScript")) Resolved = LoadFModelReference(Pair.Value->AsObject());
+        const bool bIsFunctionScript = Property->GetName() == TEXT("FunctionScript");
+        if (!Resolved && !bIsFunctionScript) Resolved = LoadFModelReference(Pair.Value->AsObject());
+        // External UNiagaraScript references can load successfully while containing no
+        // output usage recognized by this engine version, and the function-call node's
+        // history/parameter-map trace code dereferences that missing output and crashes.
+        // Only accept an externally-loaded FunctionScript once its graph is confirmed to
+        // have a usable Module/Function/DynamicInput output; otherwise leave it unresolved.
+        if (!Resolved && bIsFunctionScript)
+        {
+            if (UNiagaraScript* CandidateScript = Cast<UNiagaraScript>(LoadFModelReference(Pair.Value->AsObject())))
+                if (UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(CandidateScript->GetSource()))
+                    if (Source->NodeGraph &&
+                        (FindMatchingOutput(Source->NodeGraph, ENiagaraScriptUsage::Module) ||
+                         FindMatchingOutput(Source->NodeGraph, ENiagaraScriptUsage::Function) ||
+                         FindMatchingOutput(Source->NodeGraph, ENiagaraScriptUsage::DynamicInput)))
+                        Resolved = CandidateScript;
+        }
         if (Resolved && Resolved->IsA(ObjectProperty->PropertyClass)) ObjectProperty->SetObjectPropertyValue_InContainer(Target, Resolved);
         else Report.Warnings.Add(FString::Printf(TEXT("%s: unresolved reference %s"), *Target->GetPathName(), *Property->GetName()));
     }
@@ -403,7 +418,8 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
         if ((*Type)->TryGetBoolField(TEXT("bIsReference"), Flag)) Pin->PinType.bIsReference = Flag;
         if ((*Type)->TryGetBoolField(TEXT("bIsConst"), Flag)) Pin->PinType.bIsConst = Flag;
         if ((*Type)->TryGetBoolField(TEXT("bIsWeakPointer"), Flag)) Pin->PinType.bIsWeakPointer = Flag;
-        if ((*Type)->TryGetBoolField(TEXT("bIsUObjectWrapper"), Flag)) Pin->PinType.bIsUObjectWrapper = Flag;
+        // bIsUObjectWrapper: not present on FEdGraphPinType in this engine build. If your
+        // engine header does have it under a different name, restore this with that name.
 
         const TSharedPtr<FJsonObject>* SubObject = nullptr;
         if ((*Type)->TryGetObjectField(TEXT("PinSubCategoryObject"), SubObject))
@@ -451,7 +467,7 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
     }
 }
 
-static UNiagaraNodeOutput* FindMatchingOutput(UNiagaraGraph* Graph, ENiagaraScriptUsage Usage, const FGuid& UsageId = FGuid())
+static UNiagaraNodeOutput* FindMatchingOutput(UNiagaraGraph* Graph, ENiagaraScriptUsage Usage, const FGuid& UsageId)
 {
     if (!Graph) return nullptr;
     for (UEdGraphNode* GraphNode : Graph->Nodes)
@@ -607,9 +623,9 @@ static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>
         if (SwitchType.EndsWith(TEXT("::Integer"))) Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Integer;
         else if (SwitchType.EndsWith(TEXT("::Enum"))) Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
         else Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Bool;
-        double MaxInt = OptionCount - 1;
-        (*SwitchData)->TryGetNumberField(TEXT("MaxIntCount"), MaxInt);
-        Node->SwitchTypeData.MaxIntCount = (int32)MaxInt;
+        // MaxIntCount: FStaticSwitchTypeData has no such field in 4.26 (added in a later
+        // Niagara revision). OptionCount is preserved elsewhere via OutputVars, so nothing
+        // is lost by dropping this - just skipping the UI clamp value this field controlled.
         FString Constant;
         if ((*SwitchData)->TryGetStringField(TEXT("SwitchConstant"), Constant)) Node->SwitchTypeData.SwitchConstant = *Constant;
         const TSharedPtr<FJsonObject>* EnumRef = nullptr;
@@ -622,7 +638,6 @@ static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>
     {
         // New boolean switches omit the type struct because Bool is the default.
         Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Bool;
-        Node->SwitchTypeData.MaxIntCount = 1;
     }
 }
 
@@ -1042,18 +1057,25 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             {
                 if (!Pin) continue;
                 const FString PinName = Pin->PinName.ToString();
+                // 4.26: UNiagaraNodeIf's FPinGuidsForPath only has InputTruePinGuid /
+                // InputFalsePinGuid (the A/B generalization came later). Pin names on this
+                // node's inputs are suffixed " True" / " False" accordingly. If your source
+                // JSON is exported from a newer engine and actually uses " A" / " B" pin
+                // names, those pins simply won't match here - the 4.26 If node can't express
+                // more than one True/False pair per node, so that data has no home in this
+                // engine version regardless of what this code does.
                 if (Pin->Direction == EGPD_Input && PinName.Equals(TEXT("Condition"), ESearchCase::IgnoreCase)) IfNode->ConditionPinGuid = Pin->PersistentGuid;
-                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" A")))
+                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" True")))
                 {
-                    const FString BaseName = PinName.LeftChop(2);
+                    const FString BaseName = PinName.LeftChop(5);
                     for (int32 Index = 0; Index < IfNode->OutputVars.Num(); ++Index)
-                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputAPinGuid = Pin->PersistentGuid;
+                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputTruePinGuid = Pin->PersistentGuid;
                 }
-                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" B")))
+                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" False")))
                 {
-                    const FString BaseName = PinName.LeftChop(2);
+                    const FString BaseName = PinName.LeftChop(6);
                     for (int32 Index = 0; Index < IfNode->OutputVars.Num(); ++Index)
-                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputBPinGuid = Pin->PersistentGuid;
+                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputFalsePinGuid = Pin->PersistentGuid;
                 }
                 else if (Pin->Direction == EGPD_Output && Pin->PinType.PinSubCategory != TEXT("DynamicAddPin"))
                 {

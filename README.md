@@ -13,4 +13,4 @@ Your Script should now be imported in /Game/ImportedNiagara/YourAsset !
 
 Script settings dont apply, i will prob add those when i feel like it.
 
-Missing / Changed Nodes (90% of the time it SHOUlD import as a comment. There is a possibility it imports as a dummy node.)
+Missing / Changed Nodes (90% of the time it SHOULD import as a comment. There is a possibility it imports as a dummy node.)

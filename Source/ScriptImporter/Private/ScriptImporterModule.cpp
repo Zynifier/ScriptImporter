@@ -1,5 +1,4 @@
 #include "ScriptImporterModule.h"
-
 #include "AssetRegistryModule.h"
 #include "DesktopPlatformModule.h"
 #include "ContentBrowserModule.h"
@@ -18,7 +17,6 @@
 #include "JsonObjectConverter.h"
 #include "LevelEditor.h"
 #include "Misc/FileHelper.h"
-#include "Misc/MessageDialog.h"
 #include "Misc/PackageName.h"
 #include "NiagaraScript.h"
 #include "NiagaraScriptSource.h"
@@ -26,6 +24,7 @@
 #include "NiagaraGraph.h"
 #include "NiagaraScriptVariable.h"
 #include "NiagaraNodeStaticSwitch.h"
+#include "NiagaraNodeUsageSelector.h"
 #include "NiagaraNodeIf.h"
 #include "NiagaraNodeFunctionCall.h"
 #include "NiagaraNodeOutput.h"
@@ -36,11 +35,8 @@
 #include "UObject/UnrealType.h"
 #include "HAL/IConsoleManager.h"
 #include "Toolkits/AssetEditorManager.h"
-
 #define LOCTEXT_NAMESPACE "ScriptImporter"
-
 DEFINE_LOG_CATEGORY_STATIC(LogNiagaraJsonImporter, Log, All);
-
 namespace ScriptImporter
 {
 struct FImportReport
@@ -51,7 +47,6 @@ struct FImportReport
     int32 Links = 0;
     TArray<FString> Warnings;
     TArray<FString> Errors;
-
     FString Format() const
     {
         FString Result = FString::Printf(TEXT("Created %d objects, %d nodes, %d pins and %d links."), Objects, Nodes, Pins, Links);
@@ -60,10 +55,9 @@ struct FImportReport
         return Result;
     }
 };
-
 static bool JsonVariable(const TSharedPtr<FJsonObject>& Json, FNiagaraVariable& OutVariable, FImportReport& Report);
 static FNiagaraTypeDefinition ResolveNiagaraType(const TSharedPtr<FJsonObject>& TypeJson, FImportReport& Report);
-
+static UEnum* ResolveOrCreateSwitchEnum(UObject* Owner, const TSharedPtr<FJsonObject>& EnumRef, int32 OptionCount, FImportReport& Report);
 static void WriteReportToOutputLog(const FString& Filename, const FImportReport& Report)
 {
     UE_LOG(LogNiagaraJsonImporter, Display, TEXT("Import finished: %s (%d objects, %d nodes, %d pins, %d links)"),
@@ -73,14 +67,12 @@ static void WriteReportToOutputLog(const FString& Filename, const FImportReport&
     for (const FString& Error : Report.Errors)
         UE_LOG(LogNiagaraJsonImporter, Error, TEXT("%s"), *Error);
 }
-
 static FString CleanName(FString Name)
 {
     int32 Bracket;
     if (Name.FindChar(TEXT('['), Bracket)) Name.LeftInline(Bracket);
     return Name;
 }
-
 static bool ExportIndex(const TSharedPtr<FJsonObject>& Ref, int32& OutIndex)
 {
     FString Path;
@@ -88,7 +80,6 @@ static bool ExportIndex(const TSharedPtr<FJsonObject>& Ref, int32& OutIndex)
     int32 Dot;
     return Path.FindLastChar(TEXT('.'), Dot) && LexTryParseString(OutIndex, *Path.Mid(Dot + 1));
 }
-
 static UObject* LoadFModelReference(const TSharedPtr<FJsonObject>& Ref)
 {
     if (!Ref.IsValid()) return nullptr;
@@ -113,27 +104,18 @@ static UObject* LoadFModelReference(const TSharedPtr<FJsonObject>& Ref)
     }
     return nullptr;
 }
-
 static UClass* ResolveClass(const FString& Type)
 {
-    // Static switches exist in every supported engine version, but their
-    // reflected layout has changed several times. Never let class lookup
-    // degrade them to a generic/missing Niagara node.
     if (Type == TEXT("NiagaraNodeStaticSwitch")) return UNiagaraNodeStaticSwitch::StaticClass();
-    // UNiagaraNodeSelect was introduced after this 4.26 branch. A boolean
-    // Select is semantically identical to the native UNiagaraNodeIf.
-    if (Type == TEXT("NiagaraNodeSelect")) return UNiagaraNodeIf::StaticClass();
-    // Convert nodes from the 41.30 graph contain type/layout combinations
-    // which 17.XX dereferences unsafely during PostLoad. Preserve their graph
-    // footprint as generic nodes instead of creating a crashable object.
     if (UClass* Found = FindObject<UClass>(ANY_PACKAGE, *Type)) return Found;
     for (const TCHAR* Module : { TEXT("NiagaraEditor"), TEXT("Niagara"), TEXT("Engine") })
     {
         if (UClass* Found = LoadObject<UClass>(nullptr, *FString::Printf(TEXT("/Script/%s.%s"), Module, *Type))) return Found;
     }
+    if (Type == TEXT("NiagaraNodeSelect"))
+        return UNiagaraNodeIf::StaticClass();
     return nullptr;
 }
-
 static TSharedPtr<FJsonValue> Normalize(const TSharedPtr<FJsonValue>& Value)
 {
     if (!Value.IsValid()) return Value;
@@ -154,7 +136,6 @@ static TSharedPtr<FJsonValue> Normalize(const TSharedPtr<FJsonValue>& Value)
     }
     return Value;
 }
-
 static void ApplyScalarAndStructProperties(UObject* Target, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     if (!Target || !Properties.IsValid()) return;
@@ -217,9 +198,6 @@ static void ApplyScalarAndStructProperties(UObject* Target, const TSharedPtr<FJs
         if (!FJsonObjectConverter::JsonValueToUProperty(Normalize(Pair.Value), Property, Property->ContainerPtrToValuePtr<void>(Target)))
             Report.Warnings.Add(FString::Printf(TEXT("%s: could not set %s"), *Target->GetPathName(), *Name));
     }
-    // FModel suffixes duplicate serialized fields (for example NodeGuid[21]).
-    // JsonObjectConverter does not reliably convert its string GUID form in
-    // this engine version, so preserve core graph-node identity explicitly.
     if (UEdGraphNode* Node = Cast<UEdGraphNode>(Target))
     {
         for (const auto& Pair : Properties->Values)
@@ -232,7 +210,6 @@ static void ApplyScalarAndStructProperties(UObject* Target, const TSharedPtr<FJs
         if (!Node->NodeGuid.IsValid()) Node->CreateNewGuid();
     }
 }
-
 static void ApplyObjectProperties(UObject* Target, const TSharedPtr<FJsonObject>& Properties, const TMap<int32, UObject*>& Objects, FImportReport& Report)
 {
     if (!Target || !Properties.IsValid()) return;
@@ -246,16 +223,11 @@ static void ApplyObjectProperties(UObject* Target, const TSharedPtr<FJsonObject>
         if (ExportIndex(Pair.Value->AsObject(), Index))
             if (UObject* const* Found = Objects.Find(Index))
                 if ((*Found)->IsA(ObjectProperty->PropertyClass)) Resolved = *Found;
-        // Cross-version external Niagara scripts can load successfully while
-        // containing no output usage recognized by 17.XX; its function-call
-        // history code dereferences that missing output. Keep those references
-        // unresolved unless the function is part of this imported object set.
         if (!Resolved && Property->GetName() != TEXT("FunctionScript")) Resolved = LoadFModelReference(Pair.Value->AsObject());
         if (Resolved && Resolved->IsA(ObjectProperty->PropertyClass)) ObjectProperty->SetObjectPropertyValue_InContainer(Target, Resolved);
         else Report.Warnings.Add(FString::Printf(TEXT("%s: unresolved reference %s"), *Target->GetPathName(), *Property->GetName()));
     }
 }
-
 static FGuid GuidField(const TSharedPtr<FJsonObject>& Json, const TCHAR* Name)
 {
     FGuid Guid;
@@ -263,7 +235,6 @@ static FGuid GuidField(const TSharedPtr<FJsonObject>& Json, const TCHAR* Name)
     if (Json.IsValid() && Json->TryGetStringField(Name, Text)) FGuid::Parse(Text, Guid);
     return Guid;
 }
-
 static FNiagaraTypeDefinition ResolveNiagaraType(const TSharedPtr<FJsonObject>& TypeJson, FImportReport& Report)
 {
     const TSharedPtr<FJsonObject>* TypeRef = nullptr;
@@ -273,6 +244,7 @@ static FNiagaraTypeDefinition ResolveNiagaraType(const TSharedPtr<FJsonObject>& 
     FString ObjectPath;
     (*TypeRef)->TryGetStringField(TEXT("ObjectName"), ObjectName);
     (*TypeRef)->TryGetStringField(TEXT("ObjectPath"), ObjectPath);
+    const bool bIsEnumRef = ObjectName.StartsWith(TEXT("Enum'")) || ObjectName.StartsWith(TEXT("UserDefinedEnum'"));
     int32 Quote = INDEX_NONE;
     if (ObjectName.FindChar(TEXT('\''), Quote)) ObjectName = ObjectName.Mid(Quote + 1).Replace(TEXT("'"), TEXT(""));
     if (ObjectName == TEXT("NiagaraParameterMap")) return FNiagaraTypeDefinition::GetParameterMapDef();
@@ -294,10 +266,11 @@ static FNiagaraTypeDefinition ResolveNiagaraType(const TSharedPtr<FJsonObject>& 
         if (UScriptStruct* Struct = Cast<UScriptStruct>(Resolved)) return FNiagaraTypeDefinition(Struct);
         if (UClass* Class = Cast<UClass>(Resolved)) return FNiagaraTypeDefinition(Class);
     }
+    if (bIsEnumRef)
+        return FNiagaraTypeDefinition(ResolveOrCreateSwitchEnum(GetTransientPackage(), *TypeRef, 2, Report));
     Report.Warnings.AddUnique(FString::Printf(TEXT("Niagara type is unavailable in 17.XX and was replaced with int: %s"), *ObjectName));
     return FNiagaraTypeDefinition::GetIntDef();
 }
-
 static bool JsonVariable(const TSharedPtr<FJsonObject>& Json, FNiagaraVariable& OutVariable, FImportReport& Report)
 {
     if (!Json.IsValid()) return false;
@@ -315,26 +288,19 @@ static bool JsonVariable(const TSharedPtr<FJsonObject>& Json, FNiagaraVariable& 
     }
     return true;
 }
-
 static void ApplyScriptVariable(UObject* Object, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     if (!Object || !Properties.IsValid()) return;
-    // The class lives in NiagaraEditor's private API in this engine branch, so
-    // use its reflected object plus the matching in-engine layout without
-    // linking against non-exported class functions.
     UNiagaraScriptVariable* Target = reinterpret_cast<UNiagaraScriptVariable*>(Object);
     FString DefaultMode;
     if (Properties->TryGetStringField(TEXT("DefaultMode"), DefaultMode))
     {
         if (DefaultMode.EndsWith(TEXT("::Binding"))) Target->DefaultMode = ENiagaraDefaultMode::Binding;
         else if (DefaultMode.EndsWith(TEXT("::Custom"))) Target->DefaultMode = ENiagaraDefaultMode::Custom;
-        else Target->DefaultMode = ENiagaraDefaultMode::Value; // includes newer FailIfPreviouslyNotSet
+        else Target->DefaultMode = ENiagaraDefaultMode::Value;
     }
     const TSharedPtr<FJsonObject>* Variable = nullptr;
     if (Properties->TryGetObjectField(TEXT("Variable"), Variable)) JsonVariable(*Variable, Target->Variable, Report);
-
-    // DefaultValueVariant is the authoritative value in newer Niagara. Copy it
-    // into the old FNiagaraVariable buffer used by 17.XX.
     const TSharedPtr<FJsonObject>* Variant = nullptr;
     const TArray<TSharedPtr<FJsonValue>>* ByteValues = nullptr;
     if (Properties->TryGetObjectField(TEXT("DefaultValueVariant"), Variant) && (*Variant)->TryGetArrayField(TEXT("Bytes"), ByteValues) && ByteValues->Num())
@@ -343,9 +309,6 @@ static void ApplyScriptVariable(UObject* Object, const TSharedPtr<FJsonObject>& 
         const int32 Count = FMath::Min(ByteValues->Num(), Target->Variable.GetSizeInBytes());
         for (int32 Index = 0; Index < Count; ++Index) Target->Variable.GetData()[Index] = (uint8)(*ByteValues)[Index]->AsNumber();
     }
-
-    // Convert FModel's structured localized text to the FText representation
-    // understood by this older engine, then let reflection handle the rest.
     TSharedRef<FJsonObject> Compatible = MakeShared<FJsonObject>();
     for (const auto& Pair : Properties->Values)
     {
@@ -357,7 +320,9 @@ static void ApplyScriptVariable(UObject* Object, const TSharedPtr<FJsonObject>& 
             if (Metadata->TryGetObjectField(TEXT("Description"), Description))
             {
                 FString Text;
-                if (!(*Description)->TryGetStringField(TEXT("LocalizedString"), Text)) (*Description)->TryGetStringField(TEXT("SourceString"), Text);
+                if (!(*Description)->TryGetStringField(TEXT("LocalizedString"), Text) &&
+                    !(*Description)->TryGetStringField(TEXT("CultureInvariantString"), Text))
+                    (*Description)->TryGetStringField(TEXT("SourceString"), Text);
                 Metadata->SetStringField(TEXT("Description"), Text);
             }
             Compatible->SetObjectField(Pair.Key, Metadata);
@@ -365,7 +330,6 @@ static void ApplyScriptVariable(UObject* Object, const TSharedPtr<FJsonObject>& 
         else Compatible->SetField(Pair.Key, Pair.Value);
     }
     ApplyScalarAndStructProperties(Object, Compatible, Report);
-
     double StaticSwitch = 0;
     if (Properties->TryGetNumberField(TEXT("StaticSwitchDefaultValue"), StaticSwitch))
     {
@@ -373,7 +337,6 @@ static void ApplyScriptVariable(UObject* Object, const TSharedPtr<FJsonObject>& 
         Target->Metadata.SetStaticSwitchDefaultValue((int32)StaticSwitch);
     }
 }
-
 static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImportReport& Report)
 {
     FString Text;
@@ -387,9 +350,6 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
     const TSharedPtr<FJsonObject>* Type = nullptr;
     if (Json->TryGetObjectField(TEXT("PinType"), Type))
     {
-        // Do not feed object references to JsonObjectToUStruct.  FModel's
-        // reference objects are not Unreal object paths and can partially
-        // initialize TWeakObjectPtr with invalid data.
         Pin->PinType = FEdGraphPinType();
         if ((*Type)->TryGetStringField(TEXT("PinCategory"), Text)) Pin->PinType.PinCategory = *Text;
         if ((*Type)->TryGetStringField(TEXT("PinSubCategory"), Text)) Pin->PinType.PinSubCategory = *Text;
@@ -404,7 +364,6 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
         if ((*Type)->TryGetBoolField(TEXT("bIsConst"), Flag)) Pin->PinType.bIsConst = Flag;
         if ((*Type)->TryGetBoolField(TEXT("bIsWeakPointer"), Flag)) Pin->PinType.bIsWeakPointer = Flag;
         if ((*Type)->TryGetBoolField(TEXT("bIsUObjectWrapper"), Flag)) Pin->PinType.bIsUObjectWrapper = Flag;
-
         const TSharedPtr<FJsonObject>* SubObject = nullptr;
         if ((*Type)->TryGetObjectField(TEXT("PinSubCategoryObject"), SubObject))
         {
@@ -420,18 +379,20 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
             else if (ObjectName == TEXT("NiagaraFloat")) Canonical = &FNiagaraTypeDefinition::GetFloatDef();
             else if (ObjectName == TEXT("NiagaraBool")) Canonical = &FNiagaraTypeDefinition::GetBoolDef();
             else if (ObjectName == TEXT("NiagaraNumeric")) Canonical = &FNiagaraTypeDefinition::GetGenericNumericDef();
+            else if (ObjectName == TEXT("Vector2f")) Canonical = &FNiagaraTypeDefinition::GetVec2Def();
             else if (ObjectName == TEXT("Vector3f") || ObjectName == TEXT("NiagaraPosition")) Canonical = &FNiagaraTypeDefinition::GetVec3Def();
+            else if (ObjectName == TEXT("Vector4f")) Canonical = &FNiagaraTypeDefinition::GetVec4Def();
+            else if (ObjectName == TEXT("Quat4f") || ObjectName == TEXT("Quat")) Canonical = &FNiagaraTypeDefinition::GetQuatDef();
+            else if (ObjectName == TEXT("NiagaraMatrix") || ObjectName == TEXT("Matrix44f")) Canonical = &FNiagaraTypeDefinition::GetMatrix4Def();
             else if (ObjectName == TEXT("LinearColor")) Canonical = &FNiagaraTypeDefinition::GetColorDef();
             else if (ObjectName == TEXT("NiagaraID")) Canonical = &FNiagaraTypeDefinition::GetIDDef();
-
             if (Canonical)
             {
                 Pin->PinType = GetDefault<UEdGraphSchema_Niagara>()->TypeDefinitionToPinType(*Canonical);
             }
             else
             {
-                UObject* Resolved = nullptr;
-                if (!ObjectPath.IsEmpty()) Resolved = LoadObject<UObject>(nullptr, *ObjectPath);
+                UObject* Resolved = LoadFModelReference(*SubObject);
                 if (UEnum* Enum = Cast<UEnum>(Resolved))
                     Pin->PinType = GetDefault<UEdGraphSchema_Niagara>()->TypeDefinitionToPinType(FNiagaraTypeDefinition(Enum));
                 else if (UScriptStruct* Struct = Cast<UScriptStruct>(Resolved))
@@ -440,9 +401,6 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
                     Pin->PinType = GetDefault<UEdGraphSchema_Niagara>()->TypeDefinitionToPinType(FNiagaraTypeDefinition(Class));
                 else
                 {
-                    // Niagara 17.XX assumes every Type-category pin resolves to
-                    // a valid type and dereferences it while hashing the graph.
-                    // Use canonical int as a safe compatibility placeholder.
                     Pin->PinType = GetDefault<UEdGraphSchema_Niagara>()->TypeDefinitionToPinType(FNiagaraTypeDefinition::GetIntDef());
                     Report.Warnings.AddUnique(FString::Printf(TEXT("Pin type is unavailable in 17.XX and was replaced with int: %s"), *ObjectName));
                 }
@@ -450,7 +408,6 @@ static void FillPin(UEdGraphPin* Pin, const TSharedPtr<FJsonObject>& Json, FImpo
         }
     }
 }
-
 static UNiagaraNodeOutput* FindMatchingOutput(UNiagaraGraph* Graph, ENiagaraScriptUsage Usage, const FGuid& UsageId = FGuid())
 {
     if (!Graph) return nullptr;
@@ -459,7 +416,6 @@ static UNiagaraNodeOutput* FindMatchingOutput(UNiagaraGraph* Graph, ENiagaraScri
             if (Output->GetUsage() == Usage && (!UsageId.IsValid() || Output->GetUsageId() == UsageId)) return Output;
     return nullptr;
 }
-
 static void RunSystemInsertionTest(const TArray<FString>& Args)
 {
     if (Args.Num() < 2)
@@ -483,7 +439,6 @@ static void RunSystemInsertionTest(const TArray<FString>& Args)
         return;
     }
     UE_LOG(LogNiagaraJsonImporter, Display, TEXT("NIAGARA_JSON_SYSTEM_TEST: callable Module output verified: %s"), *CallableOutput->GetPathName());
-
     UPackage* TestPackage = GetTransientPackage();
     UNiagaraSystem* TestSystem = Cast<UNiagaraSystem>(StaticDuplicateObject(SourceSystem, TestPackage,
         *FString::Printf(TEXT("NJI_SystemTest_%llu"), FPlatformTime::Cycles64())));
@@ -499,13 +454,11 @@ static void RunSystemInsertionTest(const TArray<FString>& Args)
         UE_LOG(LogNiagaraJsonImporter, Error, TEXT("NIAGARA_JSON_SYSTEM_TEST: duplicate has no particle-update output"));
         return;
     }
-
     UEdGraph* Graph = TargetOutput->GetGraph();
     FGraphNodeCreator<UNiagaraNodeFunctionCall> Creator(*Graph);
     UNiagaraNodeFunctionCall* FunctionCall = Creator.CreateNode();
     FunctionCall->FunctionScript = ModuleScript;
     Creator.Finalize();
-
     const UEdGraphSchema_Niagara* Schema = GetDefault<UEdGraphSchema_Niagara>();
     UEdGraphPin* TargetInput = nullptr;
     UEdGraphPin* ModuleInput = nullptr;
@@ -532,12 +485,30 @@ static void RunSystemInsertionTest(const TArray<FString>& Args)
     FAssetEditorManager::Get().OpenEditorForAsset(TestSystem);
     UE_LOG(LogNiagaraJsonImporter, Display, TEXT("NIAGARA_JSON_SYSTEM_TEST: PASS stack editor opened"));
 }
-
 static FAutoConsoleCommand GNiagaraJsonSystemTestCommand(
     TEXT("NiagaraJson.TestSystemInsert"),
     TEXT("Insert a module into a transient duplicate of a Niagara system and open its stack editor."),
     FConsoleCommandWithArgsDelegate::CreateStatic(&RunSystemInsertionTest));
-
+static UEnum* StripHiddenEnumEntries(UEnum* Source, UObject* Owner, FImportReport& Report)
+{
+    if (!Source) return Source;
+    const int32 Count = Source->NumEnums();
+    bool bAnyHidden = false;
+    for (int32 Index = 0; Index < Count; ++Index)
+        if (Source->HasMetaData(TEXT("Hidden"), Index) || Source->HasMetaData(TEXT("Spacer"), Index)) { bAnyHidden = true; break; }
+    if (!bAnyHidden) return Source;
+    UObject* EnumOuter = Owner ? static_cast<UObject*>(Owner->GetOutermost()) : nullptr;
+    if (!EnumOuter) EnumOuter = Owner;
+    const FName UniqueName = MakeUniqueObjectName(EnumOuter, UEnum::StaticClass(), *(Source->GetName() + TEXT("_Dense")));
+    UEnum* Clone = NewObject<UEnum>(EnumOuter, UniqueName, RF_Transactional);
+    TArray<TPair<FName, int64>> Values;
+    Values.Reserve(Count);
+    for (int32 Index = 0; Index < Count; ++Index)
+        Values.Emplace(Source->GetNameByIndex(Index), Source->GetValueByIndex(Index));
+    Clone->SetEnums(Values, Source->GetCppForm());
+    Report.Warnings.AddUnique(FString::Printf(TEXT("Static-switch enum %s has Hidden/Spacer entries, which desync its pins from the raw switch value; using an unhidden clone"), *Source->GetName()));
+    return Clone;
+}
 static UEnum* ResolveOrCreateSwitchEnum(UObject* Owner, const TSharedPtr<FJsonObject>& EnumRef, int32 OptionCount, FImportReport& Report)
 {
     FString ObjectName;
@@ -549,36 +520,46 @@ static UEnum* ResolveOrCreateSwitchEnum(UObject* Owner, const TSharedPtr<FJsonOb
     }
     int32 Quote = INDEX_NONE;
     if (ObjectName.FindChar(TEXT('\''), Quote)) ObjectName = ObjectName.Mid(Quote + 1).Replace(TEXT("'"), TEXT(""));
-    if (UEnum* Existing = FindObject<UEnum>(ANY_PACKAGE, *ObjectName))
-        if (Existing->NumEnums() - 1 == FMath::Max(OptionCount, 2)) return Existing;
     if (ObjectPath.StartsWith(TEXT("/Script/")))
     {
         FString Module = ObjectPath.Mid(8);
         if (UEnum* Existing = LoadObject<UEnum>(nullptr, *(TEXT("/Script/") + Module + TEXT(".") + ObjectName)))
-            if (Existing->NumEnums() - 1 == FMath::Max(OptionCount, 2)) return Existing;
+        {
+            if (Existing->NumEnums() - 1 != FMath::Max(OptionCount, 2))
+            {
+                Report.Warnings.AddUnique(FString::Printf(TEXT("Static-switch enum %s has %d option(s), not the %d implied by NumOptionsPerVariable; using the resolved enum as authoritative"),
+                    *ObjectName, Existing->NumEnums() - 1, FMath::Max(OptionCount, 2)));
+            }
+            return StripHiddenEnumEntries(Existing, Owner, Report);
+        }
     }
-
+    if (UEnum* Loaded = Cast<UEnum>(LoadFModelReference(EnumRef)))
+    {
+        if (Loaded->NumEnums() - 1 != FMath::Max(OptionCount, 2))
+        {
+            Report.Warnings.AddUnique(FString::Printf(TEXT("Static-switch enum %s has %d option(s), not the %d implied by NumOptionsPerVariable; using the resolved enum as authoritative"),
+                *ObjectName, Loaded->NumEnums() - 1, FMath::Max(OptionCount, 2)));
+        }
+        return StripHiddenEnumEntries(Loaded, Owner, Report);
+    }
     const FString SafeName = ObjectName.IsEmpty() ? TEXT("ImportedStaticSwitchEnum") : ObjectName;
-    // Keep compatibility enums at package scope. Niagara duplicates script
-    // sources/graphs into transient packages while compiling a module in a
-    // system; an enum nested below the graph is duplicated too, registering
-    // the same qualified value names repeatedly and destabilizing compilation.
     UObject* EnumOuter = Owner ? static_cast<UObject*>(Owner->GetOutermost()) : nullptr;
     if (!EnumOuter) EnumOuter = Owner;
     if (EnumOuter)
         if (UEnum* Shared = FindObject<UEnum>(EnumOuter, *SafeName))
             if (Shared->NumEnums() - 1 == FMath::Max(OptionCount, 2)) return Shared;
-    UEnum* Synthetic = NewObject<UEnum>(EnumOuter, *SafeName, RF_Transactional);
+    const FName UniqueName = MakeUniqueObjectName(EnumOuter, UEnum::StaticClass(), *SafeName);
+    const FString UniqueBase = UniqueName.ToString();
+    UEnum* Synthetic = NewObject<UEnum>(EnumOuter, UniqueName, RF_Transactional);
     TArray<TPair<FName, int64>> Values;
     const int32 Count = FMath::Max(OptionCount, 2);
     for (int32 Index = 0; Index < Count; ++Index)
-        Values.Emplace(*FString::Printf(TEXT("%s::Option%d"), *SafeName, Index), Index);
-    Values.Emplace(*FString::Printf(TEXT("%s::%s_MAX"), *SafeName, *SafeName), Count);
+        Values.Emplace(*FString::Printf(TEXT("%s::Option%d"), *UniqueBase, Index), Index);
+    Values.Emplace(*FString::Printf(TEXT("%s::%s_MAX"), *UniqueBase, *UniqueBase), Count);
     Synthetic->SetEnums(Values, UEnum::ECppForm::Namespaced);
     Report.Warnings.AddUnique(FString::Printf(TEXT("Static-switch enum %s is unavailable in 17.XX; synthesized a %d-option compatible enum"), *SafeName, Count));
     return Synthetic;
 }
-
 static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     UNiagaraNodeStaticSwitch* Node = Cast<UNiagaraNodeStaticSwitch>(Object);
@@ -598,7 +579,6 @@ static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>
             if (Value->Type == EJson::Object && JsonVariable(Value->AsObject(), Variable, Report)) Node->OutputVars.Add(Variable);
         }
     }
-
     const TSharedPtr<FJsonObject>* SwitchData = nullptr;
     if (Properties->TryGetObjectField(TEXT("SwitchTypeData"), SwitchData))
     {
@@ -607,9 +587,6 @@ static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>
         if (SwitchType.EndsWith(TEXT("::Integer"))) Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Integer;
         else if (SwitchType.EndsWith(TEXT("::Enum"))) Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Enum;
         else Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Bool;
-        double MaxInt = OptionCount - 1;
-        (*SwitchData)->TryGetNumberField(TEXT("MaxIntCount"), MaxInt);
-        Node->SwitchTypeData.MaxIntCount = (int32)MaxInt;
         FString Constant;
         if ((*SwitchData)->TryGetStringField(TEXT("SwitchConstant"), Constant)) Node->SwitchTypeData.SwitchConstant = *Constant;
         const TSharedPtr<FJsonObject>* EnumRef = nullptr;
@@ -620,12 +597,9 @@ static void ApplyStaticSwitchType(UObject* Object, const TSharedPtr<FJsonObject>
     }
     else
     {
-        // New boolean switches omit the type struct because Bool is the default.
         Node->SwitchTypeData.SwitchType = ENiagaraStaticSwitchType::Bool;
-        Node->SwitchTypeData.MaxIntCount = 1;
     }
 }
-
 static void ApplyFunctionCallCompatibility(UObject* Object, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     if (!Object || !Object->IsA<UNiagaraNodeFunctionCall>() || !Properties.IsValid()) return;
@@ -645,7 +619,6 @@ static void ApplyFunctionCallCompatibility(UObject* Object, const TSharedPtr<FJs
         Node->PropagatedStaticSwitchParameters.Add(MoveTemp(Entry));
     }
 }
-
 static void ApplySelectCompatibility(UObject* Object, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     UNiagaraNodeIf* Node = Cast<UNiagaraNodeIf>(Object);
@@ -671,7 +644,6 @@ static void ApplySelectCompatibility(UObject* Object, const TSharedPtr<FJsonObje
         }
     }
 }
-
 static void ApplyConvertCompatibility(UObject* Object, const TSharedPtr<FJsonObject>& Properties, FImportReport& Report)
 {
     if (!Object || Object->GetClass()->GetName() != TEXT("NiagaraNodeConvert") || !Properties.IsValid()) return;
@@ -725,26 +697,22 @@ static void ApplyConvertCompatibility(UObject* Object, const TSharedPtr<FJsonObj
         SetPath(ConnectionData, TEXT("DestinationPath"), JsonConnection);
     }
 }
-
 static UNiagaraScript* Import(const FString& Filename, const FString& PackageName, FImportReport& Report)
 {
     FString Text;
     if (!FFileHelper::LoadFileToString(Text, *Filename)) { Report.Errors.Add(TEXT("Could not read JSON.")); return nullptr; }
     TArray<TSharedPtr<FJsonValue>> Exports;
     if (!FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Exports)) { Report.Errors.Add(TEXT("Invalid JSON export array.")); return nullptr; }
-
     int32 ScriptIndex = INDEX_NONE;
     for (int32 Index = 0; Index < Exports.Num(); ++Index)
         if (Exports[Index]->AsObject()->GetStringField(TEXT("Type")) == TEXT("NiagaraScript")) { ScriptIndex = Index; break; }
     if (ScriptIndex == INDEX_NONE) { Report.Errors.Add(TEXT("No NiagaraScript export.")); return nullptr; }
-
     UPackage* Package = CreatePackage(*PackageName);
     UNiagaraScript* Script = NewObject<UNiagaraScript>(Package, *FPackageName::GetLongPackageAssetName(PackageName), RF_Public | RF_Standalone | RF_Transactional);
     TMap<int32, UObject*> Objects;
     TSet<int32> MissingNodePlaceholders;
     Objects.Add(ScriptIndex, Script);
     ++Report.Objects;
-
     for (int32 Pass = 0; Pass < Exports.Num(); ++Pass)
     {
         bool Progress = false;
@@ -795,7 +763,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
     }
     for (int32 Index = 0; Index < Exports.Num(); ++Index)
         if (!Objects.Contains(Index)) Report.Warnings.AddUnique(FString::Printf(TEXT("Unsupported class or outer: %s"), *Exports[Index]->AsObject()->GetStringField(TEXT("Type"))));
-
     for (const auto& Pair : Objects)
     {
         const TSharedPtr<FJsonObject>* Properties = nullptr;
@@ -803,9 +770,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         {
             if (Pair.Value->GetClass()->GetName() == TEXT("NiagaraScriptVariable")) ApplyScriptVariable(Pair.Value, *Properties, Report);
             else ApplyScalarAndStructProperties(Pair.Value, *Properties, Report);
-            // Newer exports serialize UNiagaraNodeOutput usage as ScriptType.
-            // Generic reflection does not map that renamed enum reliably on
-            // 17.XX, leaving a particle output in a callable module graph.
             if (UNiagaraNodeOutput* Output = Cast<UNiagaraNodeOutput>(Pair.Value))
             {
                 FString ScriptType;
@@ -816,7 +780,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             }
         }
     }
-
     for (const auto& Pair : Objects)
     {
         const TSharedPtr<FJsonObject>* Properties = nullptr;
@@ -824,6 +787,18 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         if (Exports[Pair.Key]->AsObject()->TryGetObjectField(TEXT("Properties"), Properties)) ApplyFunctionCallCompatibility(Pair.Value, *Properties, Report);
         if (Exports[Pair.Key]->AsObject()->TryGetObjectField(TEXT("Properties"), Properties)) ApplySelectCompatibility(Pair.Value, *Properties, Report);
     }
+    for (const auto& Pair : Objects)
+        if (UNiagaraNodeUsageSelector* Selector = Cast<UNiagaraNodeUsageSelector>(Pair.Value))
+        {
+            const int32 Needed = Selector->OutputVars.Num();
+            if (Selector->OutputVarGuids.Num() != Needed)
+            {
+                const int32 Previous = Selector->OutputVarGuids.Num();
+                Selector->OutputVarGuids.SetNum(Needed);
+                for (int32 Index = Previous; Index < Needed; ++Index) Selector->OutputVarGuids[Index] = FGuid::NewGuid();
+                Report.Warnings.AddUnique(FString::Printf(TEXT("%s: OutputVarGuids count did not match OutputVars; regenerated to avoid a refresh crash"), *Selector->GetName()));
+            }
+        }
     for (const auto& Pair : Objects)
     {
         const TSharedPtr<FJsonObject>* Properties = nullptr;
@@ -833,9 +808,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             ApplyConvertCompatibility(Pair.Value, *Properties, Report);
         }
     }
-    // Object-reference application is the final generic property pass and can
-    // restore a newer enum representation. Normalize callable output usage
-    // only after that pass has finished.
     for (const auto& Pair : Objects)
         if (UNiagaraNodeOutput* Output = Cast<UNiagaraNodeOutput>(Pair.Value))
         {
@@ -851,11 +823,16 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
                     Output->SetUsageId(FGuid());
             }
         }
-
-    // 41.30 moved stack order/category into hierarchy objects. 17.XX has no
-    // hierarchy classes, so translate their ordered GUID identities back onto
-    // the older per-variable metadata representation.
-    TMultiMap<FGuid, UObject*> VariablesByGuid;
+    auto GraphScopeOf = [&](int32 ExportIndexValue) -> FString
+    {
+        if (!Exports.IsValidIndex(ExportIndexValue)) return FString();
+        const TSharedPtr<FJsonObject>* Outer = nullptr;
+        FString ObjectName;
+        if (Exports[ExportIndexValue]->AsObject()->TryGetObjectField(TEXT("Outer"), Outer))
+            (*Outer)->TryGetStringField(TEXT("ObjectName"), ObjectName);
+        return ObjectName;
+    };
+    TMultiMap<FGuid, TPair<UObject*, FString>> VariablesByGuid;
     for (const auto& Pair : Objects)
     {
         if (Pair.Value->GetClass()->GetName() != TEXT("NiagaraScriptVariable")) continue;
@@ -865,9 +842,9 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         FGuid Guid;
         if (Exports[Pair.Key]->AsObject()->TryGetObjectField(TEXT("Properties"), Properties) &&
             (*Properties)->TryGetObjectField(TEXT("Metadata"), Metadata) && (*Metadata)->TryGetStringField(TEXT("VariableGuid"), GuidText) && FGuid::Parse(GuidText, Guid))
-            VariablesByGuid.Add(Guid, Pair.Value);
+            VariablesByGuid.Add(Guid, TPair<UObject*, FString>(Pair.Value, GraphScopeOf(Pair.Key)));
     }
-    TFunction<void(int32, const FString&, int32&)> ApplyHierarchy = [&](int32 ExportIndexValue, const FString& ParentCategory, int32& Priority)
+    TFunction<void(int32, const FString&, int32&, const FString&)> ApplyHierarchy = [&](int32 ExportIndexValue, const FString& ParentCategory, int32& Priority, const FString& Scope)
     {
         if (!Exports.IsValidIndex(ExportIndexValue)) return;
         const TSharedPtr<FJsonObject> Item = Exports[ExportIndexValue]->AsObject();
@@ -884,11 +861,12 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             if ((*Properties)->TryGetObjectField(TEXT("Identity"), Identity) && (*Identity)->TryGetArrayField(TEXT("Guids"), Guids) && Guids->Num() &&
                 FGuid::Parse((*Guids)[0]->AsString(), Guid))
             {
-                TArray<UObject*> FoundVariables;
+                TArray<TPair<UObject*, FString>> FoundVariables;
                 VariablesByGuid.MultiFind(Guid, FoundVariables);
-                for (UObject* Found : FoundVariables)
+                for (const TPair<UObject*, FString>& Found : FoundVariables)
                 {
-                    UNiagaraScriptVariable* Variable = reinterpret_cast<UNiagaraScriptVariable*>(Found);
+                    if (!Scope.IsEmpty() && !Found.Value.IsEmpty() && Found.Value != Scope) continue;
+                    UNiagaraScriptVariable* Variable = reinterpret_cast<UNiagaraScriptVariable*>(Found.Key);
                     Variable->Metadata.EditorSortPriority = Priority;
                     if (!Category.IsEmpty()) Variable->Metadata.CategoryName = FText::FromString(Category);
                 }
@@ -900,14 +878,11 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             for (const TSharedPtr<FJsonValue>& Child : *Children)
             {
                 int32 ChildIndex = INDEX_NONE;
-                if (Child->Type == EJson::Object && ExportIndex(Child->AsObject(), ChildIndex)) ApplyHierarchy(ChildIndex, Category, Priority);
+                if (Child->Type == EJson::Object && ExportIndex(Child->AsObject(), ChildIndex)) ApplyHierarchy(ChildIndex, Category, Priority, Scope);
             }
     };
     for (int32 Index = 0; Index < Exports.Num(); ++Index)
-        if (Exports[Index]->AsObject()->GetStringField(TEXT("Type")) == TEXT("HierarchyRoot")) { int32 Priority = 0; ApplyHierarchy(Index, FString(), Priority); }
-
-    // FJsonObjectConverter cannot resolve FModel export references embedded in
-    // TMap values. Recreate each graph's canonical variable map explicitly.
+        if (Exports[Index]->AsObject()->GetStringField(TEXT("Type")) == TEXT("HierarchyRoot")) { int32 Priority = 0; ApplyHierarchy(Index, FString(), Priority, GraphScopeOf(Index)); }
     for (const auto& Pair : Objects)
     {
         UNiagaraGraph* Graph = Cast<UNiagaraGraph>(Pair.Value);
@@ -939,11 +914,30 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         }
         Map.Rehash();
     }
-
-    // Current Niagara stores the editable default and the static-switch flag
-    // on the graph's script variable, not solely on the node. Older exports
-    // may omit that flag even though a native static-switch node references
-    // the variable, so normalize it before pin allocation/PostLoad.
+    for (const auto& Pair : Objects)
+    {
+        if (Pair.Value->GetClass()->GetName() != TEXT("NiagaraNodeParameterMapGet")) continue;
+        const TSharedPtr<FJsonObject>* Properties = nullptr;
+        const TArray<TSharedPtr<FJsonValue>>* Entries = nullptr;
+        if (!Exports[Pair.Key]->AsObject()->TryGetObjectField(TEXT("Properties"), Properties) ||
+            !(*Properties)->TryGetArrayField(TEXT("PinOutputToPinDefaultPersistentId"), Entries)) continue;
+        FMapProperty* MapProperty = CastField<FMapProperty>(Pair.Value->GetClass()->FindPropertyByName(TEXT("PinOutputToPinDefaultPersistentId")));
+        if (!MapProperty) continue;
+        FScriptMapHelper Map(MapProperty, MapProperty->ContainerPtrToValuePtr<void>(Pair.Value));
+        Map.EmptyValues();
+        for (const TSharedPtr<FJsonValue>& EntryValue : *Entries)
+        {
+            const TSharedPtr<FJsonObject> Entry = EntryValue->AsObject();
+            FGuid KeyGuid, ValueGuid;
+            FString KeyText, ValueText;
+            if (!Entry.IsValid() || !Entry->TryGetStringField(TEXT("Key"), KeyText) || !Entry->TryGetStringField(TEXT("Value"), ValueText) ||
+                !FGuid::Parse(KeyText, KeyGuid) || !FGuid::Parse(ValueText, ValueGuid)) continue;
+            const int32 NewIndex = Map.AddDefaultValue_Invalid_NeedsRehash();
+            MapProperty->KeyProp->CopyCompleteValue(Map.GetKeyPtr(NewIndex), &KeyGuid);
+            MapProperty->ValueProp->CopyCompleteValue(Map.GetValuePtr(NewIndex), &ValueGuid);
+        }
+        Map.Rehash();
+    }
     for (const auto& Pair : Objects)
     {
         UNiagaraNodeStaticSwitch* StaticSwitch = Cast<UNiagaraNodeStaticSwitch>(Pair.Value);
@@ -954,7 +948,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
                 if (Variable->Variable.GetName() == StaticSwitch->InputParameterName)
                     Variable->Metadata.SetIsStaticSwitch(true);
     }
-
     TMap<FString, UEdGraphPin*> Pins;
     for (const auto& Pair : Objects)
     {
@@ -965,31 +958,36 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         if (!Exports[Pair.Key]->AsObject()->TryGetArrayField(TEXT("Pins"), JsonPins)) continue;
         UNiagaraNodeStaticSwitch* StaticSwitch = Cast<UNiagaraNodeStaticSwitch>(Node);
         UNiagaraNodeIf* CompatibilityIf = Cast<UNiagaraNodeIf>(Node);
-        if (!StaticSwitch && !CompatibilityIf)
+        bool bIsVariablePinCountClass = false;
+        for (UClass* Class = Node->GetClass(); Class; Class = Class->GetSuperClass())
+            if (Class->GetName() == TEXT("NiagaraNodeParameterMapBase")) { bIsVariablePinCountClass = true; break; }
+        const bool bNativeSelect = !StaticSwitch && !CompatibilityIf && Node->GetClass()->GetName() == TEXT("NiagaraNodeSelect");
+        // Only node types this importer has verified rebuild their pins
+        // correctly and deterministically from a bare AllocateDefaultPins()
+        // call get the native-identity treatment: switches/Select (fixed,
+        // formula-driven layout) and Map Get/Set (a fixed Source/Dest plus a
+        // user-configurable set of value pins). Other UNiagaraNodeWithDynamicPins
+        // subtypes - op nodes like Make Niagara ID, Convert, custom HLSL -
+        // need extra setup this importer doesn't perform, and calling
+        // AllocateDefaultPins() on them blindly produced an empty pin set
+        // rather than a useful one, which is worse than just trusting the
+        // raw exported pins as-is (the fallback for anything not in this set).
+        UEdGraphNode* DynamicPinsNode = (StaticSwitch || CompatibilityIf || bNativeSelect || bIsVariablePinCountClass) ? Node : nullptr;
+        const bool bNativeIdentityNode = DynamicPinsNode != nullptr;
+        const bool bFixedLayoutNode = DynamicPinsNode && !bIsVariablePinCountClass;
+        if (!bNativeIdentityNode)
             Node->Pins.Reset();
-        if (StaticSwitch)
+        else
         {
-            // A raw JSON pin array from another engine version is not a valid
-            // static-switch layout. Let this engine build pins from
-            // SwitchTypeData/OutputVars, then transfer serialized identity and
-            // defaults so the original links can still be reconstructed.
-            StaticSwitch->Pins.Reset();
-            StaticSwitch->AllocateDefaultPins();
-        }
-        else if (CompatibilityIf)
-        {
-            // UNiagaraNodeIf's compiler and stack history code look pins up by
-            // its native names and cached GUIDs.  Keep that native layout and
-            // map the newer Select pin identities onto it below.
-            CompatibilityIf->PathAssociatedPinGuids.SetNum(CompatibilityIf->OutputVars.Num());
-            CompatibilityIf->Pins.Reset();
-            CompatibilityIf->AllocateDefaultPins();
+            if (CompatibilityIf) CompatibilityIf->PathAssociatedPinGuids.SetNum(CompatibilityIf->OutputVars.Num());
+            DynamicPinsNode->Pins.Reset();
+            DynamicPinsNode->AllocateDefaultPins();
         }
         TSet<UEdGraphPin*> ClaimedNativePins;
         for (const TSharedPtr<FJsonValue>& JsonPin : *JsonPins)
         {
             UEdGraphPin* Pin = nullptr;
-            if (StaticSwitch || CompatibilityIf)
+            if (bNativeIdentityNode)
             {
                 FString JsonName;
                 FString Direction;
@@ -1000,39 +998,81 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
                 if (CompatibilityIf)
                 {
                     if (JsonName.Equals(TEXT("Selector"), ESearchCase::IgnoreCase)) NativeName = TEXT("Condition");
-                    else if (JsonName.EndsWith(TEXT(" if True"))) NativeName = JsonName.LeftChop(8) + TEXT(" A");
-                    else if (JsonName.EndsWith(TEXT(" if False"))) NativeName = JsonName.LeftChop(9) + TEXT(" B");
                 }
-                const TArray<UEdGraphPin*>& NativePins = StaticSwitch ? StaticSwitch->Pins : CompatibilityIf->Pins;
+                const TArray<UEdGraphPin*>& NativePins = DynamicPinsNode->Pins;
+                const auto IsAddPinCandidate = [](const UEdGraphPin* Candidate)
+                {
+                    return Candidate->PinType.PinSubCategory == TEXT("DynamicAddPin");
+                };
                 for (UEdGraphPin* Candidate : NativePins)
                     if (Candidate && !ClaimedNativePins.Contains(Candidate) && Candidate->Direction == JsonDirection &&
+                        !IsAddPinCandidate(Candidate) &&
                         Candidate->PinName.ToString().Equals(NativeName, ESearchCase::IgnoreCase))
                     { Pin = Candidate; break; }
-                if (!Pin)
+                if (!Pin && bFixedLayoutNode)
                     for (UEdGraphPin* Candidate : NativePins)
-                        if (Candidate && !ClaimedNativePins.Contains(Candidate) && Candidate->Direction == JsonDirection)
+                        if (Candidate && !ClaimedNativePins.Contains(Candidate) && Candidate->Direction == JsonDirection &&
+                            !IsAddPinCandidate(Candidate))
                         { Pin = Candidate; break; }
                 if (Pin) ClaimedNativePins.Add(Pin);
+            }
+            const bool bMatchedNativeCandidate = Pin != nullptr;
+            if (!Pin && bFixedLayoutNode)
+            {
+                Report.Warnings.AddUnique(FString::Printf(TEXT("%s: dropped a pin this engine's version of the node doesn't have"), *Node->GetName()));
+                continue;
             }
             if (!Pin)
             {
                 Pin = UEdGraphPin::CreatePin(Node);
                 Node->Pins.Add(Pin);
-                if (StaticSwitch || CompatibilityIf)
+                if (bNativeIdentityNode)
                     Report.Warnings.AddUnique(FString::Printf(TEXT("%s needed a compatibility pin not generated by 17.XX"), *Node->GetName()));
             }
             const FName NativePinName = Pin->PinName;
             const EEdGraphPinDirection NativeDirection = Pin->Direction;
+            const FGuid NativePersistentGuid = Pin->PersistentGuid;
             FillPin(Pin, JsonPin->AsObject(), Report);
-            if (CompatibilityIf)
+            if (bMatchedNativeCandidate)
             {
                 Pin->PinName = NativePinName;
                 Pin->Direction = NativeDirection;
+                Pin->PersistentGuid = NativePersistentGuid;
             }
             FString OriginalPinId;
             JsonPin->AsObject()->TryGetStringField(TEXT("PinId"), OriginalPinId);
             Pins.Add(FString::Printf(TEXT("%d|%s"), Pair.Key, *OriginalPinId), Pin);
             ++Report.Pins;
+        }
+        if (StaticSwitch || bNativeSelect)
+        {
+            int32 RealOutputs = 0;
+            int32 RealInputs = 0;
+            UEdGraphPin* SampleInputPin = nullptr;
+            for (UEdGraphPin* P : Node->Pins)
+            {
+                if (!P) continue;
+                if (P->Direction == EGPD_Output && P->PinType.PinSubCategory != TEXT("DynamicAddPin")) ++RealOutputs;
+                else if (P->Direction == EGPD_Input) { ++RealInputs; SampleInputPin = P; }
+            }
+            const int32 NumOptions = StaticSwitch ? StaticSwitch->NumOptionsPerVariable : (RealOutputs > 0 ? RealInputs / RealOutputs : 0);
+            const int32 Expected = NumOptions * RealOutputs;
+            if (RealOutputs > 0 && RealInputs != Expected)
+            {
+                Report.Warnings.AddUnique(FString::Printf(TEXT("%s: pin geometry short after import (%d real output var(s), %d option(s), expected %d input pin(s), found %d) - padding to avoid an out-of-bounds Refresh"),
+                    *Node->GetName(), RealOutputs, NumOptions, Expected, RealInputs));
+                for (int32 Added = RealInputs; Added < Expected; ++Added)
+                {
+                    UEdGraphPin* NewPin = SampleInputPin ? UEdGraphPin::CreatePin(Node) : nullptr;
+                    if (NewPin && SampleInputPin)
+                    {
+                        NewPin->PinType = SampleInputPin->PinType;
+                        NewPin->Direction = EGPD_Input;
+                        NewPin->PinName = *FString::Printf(TEXT("%s_PaddedOption%d"), *Node->GetName(), Added);
+                        Node->Pins.Add(NewPin);
+                    }
+                }
+            }
         }
         if (UNiagaraNodeIf* IfNode = Cast<UNiagaraNodeIf>(Node))
         {
@@ -1043,17 +1083,17 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
                 if (!Pin) continue;
                 const FString PinName = Pin->PinName.ToString();
                 if (Pin->Direction == EGPD_Input && PinName.Equals(TEXT("Condition"), ESearchCase::IgnoreCase)) IfNode->ConditionPinGuid = Pin->PersistentGuid;
-                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" A")))
+                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" if True")))
                 {
-                    const FString BaseName = PinName.LeftChop(2);
+                    const FString BaseName = PinName.LeftChop(8);
                     for (int32 Index = 0; Index < IfNode->OutputVars.Num(); ++Index)
-                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputAPinGuid = Pin->PersistentGuid;
+                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputTruePinGuid = Pin->PersistentGuid;
                 }
-                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" B")))
+                else if (Pin->Direction == EGPD_Input && PinName.EndsWith(TEXT(" if False")))
                 {
-                    const FString BaseName = PinName.LeftChop(2);
+                    const FString BaseName = PinName.LeftChop(9);
                     for (int32 Index = 0; Index < IfNode->OutputVars.Num(); ++Index)
-                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputBPinGuid = Pin->PersistentGuid;
+                        if (IfNode->OutputVars[Index].GetName().ToString() == BaseName) IfNode->PathAssociatedPinGuids[Index].InputFalsePinGuid = Pin->PersistentGuid;
                 }
                 else if (Pin->Direction == EGPD_Output && Pin->PinType.PinSubCategory != TEXT("DynamicAddPin"))
                 {
@@ -1125,7 +1165,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
             }
         }
     }
-
     TArray<UNiagaraScriptSource*> Sources;
     for (const auto& Pair : Objects) if (UNiagaraScriptSource* Source = Cast<UNiagaraScriptSource>(Pair.Value)) Sources.Add(Source);
     Sources.Sort([](const UNiagaraScriptSource& A, const UNiagaraScriptSource& B) { return A.GetName() < B.GetName(); });
@@ -1162,8 +1201,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
     if (Script->GetUsage() == ENiagaraScriptUsage::Module || Script->GetUsage() == ENiagaraScriptUsage::Function ||
         Script->GetUsage() == ENiagaraScriptUsage::DynamicInput)
         Script->SetUsageId(FGuid());
-    // Usage is editor-only/versioned in newer assets and absent from the
-    // top-level export. The active graph output is the authoritative fallback.
     if (ScriptIndex != INDEX_NONE)
     {
         const TSharedPtr<FJsonObject>* ScriptProperties = nullptr;
@@ -1177,9 +1214,6 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
     }
     if (ActiveSource && ActiveSource->NodeGraph)
     {
-        // Callable graphs in 17.XX are looked up with the default (zero)
-        // usage id.  Do this after the top-level script property pass, which
-        // may contain a newer per-version UsageId.
         if (Script->GetUsage() == ENiagaraScriptUsage::Module || Script->GetUsage() == ENiagaraScriptUsage::Function ||
             Script->GetUsage() == ENiagaraScriptUsage::DynamicInput)
             Script->SetUsageId(FGuid());
@@ -1194,26 +1228,44 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
         }
     }
     if (Sources.Num() > 1) Report.Warnings.Add(FString::Printf(TEXT("Imported all %d versioned sources as subobjects; selected %s as the most complete 17.XX-compatible source."), Sources.Num(), ActiveSource ? *ActiveSource->GetName() : TEXT("none")));
-
-    // Pin allocation can make Niagara register canonical script-variable
-    // objects which are not the same exported UObject instances. Normalize
-    // every package-owned canonical variable after graph construction so the
-    // static-switch flag survives save/load without PostLoad repairing it.
     TSet<FName> StaticSwitchParameterNames;
     for (const auto& Pair : Objects)
         if (UNiagaraNodeStaticSwitch* StaticSwitch = Cast<UNiagaraNodeStaticSwitch>(Pair.Value))
             if (!StaticSwitch->InputParameterName.IsNone())
                 StaticSwitchParameterNames.Add(StaticSwitch->InputParameterName);
+    TMap<FName, UNiagaraScriptVariable*> Authoritative;
+    for (const auto& Pair : Objects)
+        if (Pair.Value->GetClass()->GetName() == TEXT("NiagaraScriptVariable"))
+        {
+            UNiagaraScriptVariable* Variable = reinterpret_cast<UNiagaraScriptVariable*>(Pair.Value);
+            const FName VarName = Variable->Variable.GetName();
+            if (VarName.IsNone()) continue;
+            UNiagaraScriptVariable** Existing = Authoritative.Find(VarName);
+            if (!Existing || (ActiveSource && Variable->GetTypedOuter<UNiagaraScriptSource>() == ActiveSource)) Authoritative.Add(VarName, Variable);
+        }
     TArray<UObject*> PackageObjects;
     GetObjectsWithOuter(Package, PackageObjects, true);
     for (UObject* PackageObject : PackageObjects)
         if (PackageObject && PackageObject->GetClass()->GetName() == TEXT("NiagaraScriptVariable"))
         {
             UNiagaraScriptVariable* Variable = reinterpret_cast<UNiagaraScriptVariable*>(PackageObject);
-            if (StaticSwitchParameterNames.Contains(Variable->Variable.GetName()))
-                Variable->Metadata.SetIsStaticSwitch(true);
+            const FName VarName = Variable->Variable.GetName();
+            if (StaticSwitchParameterNames.Contains(VarName)) Variable->Metadata.SetIsStaticSwitch(true);
+            if (UNiagaraScriptVariable** Source = Authoritative.Find(VarName))
+                if (*Source != Variable)
+                {
+                    Variable->DefaultMode = (*Source)->DefaultMode;
+                    Variable->DefaultBinding = (*Source)->DefaultBinding;
+                    const bool bWasStaticSwitch = Variable->Metadata.GetIsStaticSwitch();
+                    Variable->Metadata = (*Source)->Metadata;
+                    if (bWasStaticSwitch) Variable->Metadata.SetIsStaticSwitch(true);
+                    if ((*Source)->Variable.IsDataAllocated())
+                    {
+                        Variable->Variable.AllocateData();
+                        FMemory::Memcpy(Variable->Variable.GetData(), (*Source)->Variable.GetData(), FMath::Min(Variable->Variable.GetSizeInBytes(), (*Source)->Variable.GetSizeInBytes()));
+                    }
+                }
         }
-
     Script->MarkPackageDirty();
     FAssetRegistryModule::AssetCreated(Script);
     Package->SetDirtyFlag(true);
@@ -1223,14 +1275,12 @@ static UNiagaraScript* Import(const FString& Filename, const FString& PackageNam
     return Script;
 }
 }
-
 void FScriptImporterModule::StartupModule()
 {
     FLevelEditorModule& LevelEditor = FModuleManager::LoadModuleChecked<FLevelEditorModule>(TEXT("LevelEditor"));
     TSharedRef<FExtender> Extender = MakeShared<FExtender>();
     Extender->AddMenuExtension(TEXT("FileProject"), EExtensionHook::After, nullptr, FMenuExtensionDelegate::CreateRaw(this, &FScriptImporterModule::AddMenuEntry));
     LevelEditor.GetMenuExtensibilityManager()->AddExtender(Extender);
-
     FString AutomatedImport;
     if (FParse::Value(FCommandLine::Get(), TEXT("NiagaraJsonImport="), AutomatedImport))
     {
@@ -1244,7 +1294,6 @@ void FScriptImporterModule::StartupModule()
             FPlatformMisc::RequestExit(false);
         });
     }
-
     FString AutomatedValidate;
     if (FParse::Value(FCommandLine::Get(), TEXT("NiagaraJsonValidate="), AutomatedValidate))
     {
@@ -1272,14 +1321,11 @@ void FScriptImporterModule::StartupModule()
         });
     }
 }
-
 void FScriptImporterModule::ShutdownModule() {}
-
 void FScriptImporterModule::AddMenuEntry(FMenuBuilder& MenuBuilder)
 {
     MenuBuilder.AddMenuEntry(LOCTEXT("Import", "Import FModel Niagara JSON..."), LOCTEXT("ImportTip", "Recreate an editable Niagara script from an enhanced FModel JSON export."), FSlateIcon(), FUIAction(FExecuteAction::CreateRaw(this, &FScriptImporterModule::OpenImportDialog)));
 }
-
 void FScriptImporterModule::OpenImportDialog()
 {
     IDesktopPlatform* Desktop = FDesktopPlatformModule::Get();
@@ -1297,9 +1343,6 @@ void FScriptImporterModule::OpenImportDialog()
         AssetsToSync.Add(Script);
         FModuleManager::LoadModuleChecked<FContentBrowserModule>(TEXT("ContentBrowser")).Get().SyncBrowserToAssets(AssetsToSync, false, true);
     }
-    FMessageDialog::Open(EAppMsgType::Ok, FText::FromString(Report.Format()));
 }
-
 IMPLEMENT_MODULE(FScriptImporterModule, ScriptImporter)
-
 #undef LOCTEXT_NAMESPACE
